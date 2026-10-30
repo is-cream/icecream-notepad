@@ -1,40 +1,36 @@
 # Notepad
 
-A plain-text notes app for Mac, in the spirit of Windows Notepad.
+A native macOS plain-text notes app, in the spirit of Windows Notepad. Written in C++ (Objective-C++ with Cocoa). No Python, no server, no browser — just a normal desktop app.
 
-- **Plain text only** — no formatting, no rich text, just like the old Windows Notepad.
-- **Auto-save** — every keystroke is written to disk. There is no Save button because you never need one.
-- **Survives restarts** — unsaved notes stay exactly as you left them, even when the machine is restarted. Open tabs and their content are restored on launch, like modern Windows Notepad.
-- **Tabs** — multiple notes open at once. `+` for a new note, `×` to close (empty notes are deleted, notes with content are kept).
-- **Local only** — everything lives in `~/.notepad/` on your machine. No cloud, no account, no telemetry.
+- **Plain text only** — no formatting, no rich text. Monospace, like the old Windows Notepad.
+- **Auto-save** — every keystroke is written to disk (`~/.notepad-cpp/notes/`). There is no Save button because you never need one.
+- **Survives restarts** — unsaved notes stay exactly as you left them, even when the machine is restarted. Open tabs and their content are restored on launch.
+- **Tabs** — `Cmd+N` for a new tab, `Cmd+W` to close. Closing a tab with content keeps the note; empty notes are deleted.
+- **Local only** — everything lives in `~/.notepad-cpp/` on your machine. No cloud, no account, no telemetry.
 
-## Run
+## Build
 
-```bash
-python3 notepad.py
-```
-
-Opens http://127.0.0.1:8421 in your browser.
-
-## Install as a Mac app
-
-Unzip `Notepad-mac.zip`, move `Notepad.app` to `/Applications`, then:
+Requires Xcode Command Line Tools (`xcode-select --install`):
 
 ```bash
-xattr -cr /Applications/Notepad.app
+cd cpp
+./build.sh
 ```
 
-Double-click to launch (macOS will ask once since the app is unsigned).
+This produces `cpp/Notepad.app`. Install it:
+
+```bash
+cp -r cpp/Notepad.app /Applications/
+xattr -cr /Applications/Notepad.app   # unsigned app, Gatekeeper bypass
+open /Applications/Notepad.app
+```
+
+## Layout
+
+- `cpp/main.mm` — the entire app, single file (~330 lines)
+- `cpp/build.sh` — compile + bundle script
+- `notepad.html` — server-free web fallback (double-click to open, uses localStorage)
 
 ## How it works
 
-Single Python 3 file, stdlib only. An HTTP server on localhost serves the UI and a small JSON API:
-
-- `GET /api/notes` — list notes
-- `POST /api/notes` — create note
-- `GET /api/notes/<id>` — read note
-- `PUT /api/notes/<id>` — save note (title + content)
-- `DELETE /api/notes/<id>` — delete note
-- `GET/PUT /api/state` — open tabs + active tab
-
-Notes are stored as JSON files in `~/.notepad/notes/`; UI state in `~/.notepad/state.json`.
+`main.mm` is Objective-C++: C++ for storage (`std::filesystem`, `std::fstream`) and Cocoa for UI (`NSWindow`, `NSTabView`, `NSTextView`). An `NSTextStorageDelegate` fires on every edit and writes the note to disk. Tab state (open ids + active id) is persisted to `~/.notepad-cpp/state.txt` on every change.

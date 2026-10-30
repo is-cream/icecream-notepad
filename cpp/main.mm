@@ -3,9 +3,9 @@
 // Build: ./build.sh   (needs Xcode Command Line Tools: xcode-select --install)
 //
 // - Plain text only, no formatting (NSTextView, monospace).
-// - Every edit auto-saves to ~/.notepad/notes/<id>.txt
+// - Every edit auto-saves to ~/.notepad-cpp/notes/<id>.txt
 // - Open tabs + contents are restored on launch (unsaved notes survive restarts).
-// - Cmd+N new tab, Cmd+W close tab, Cmd+S is a no-op (always saved).
+// - Cmd+N new tab, Cmd+W close tab.
 
 #import <Cocoa/Cocoa.h>
 #include <string>
@@ -18,6 +18,7 @@
 namespace fs = std::filesystem;
 
 // ---------------------------------------------------------------- storage
+// C++ side: std::string throughout. ObjC side: NSString*. Convert at boundary.
 
 static std::string dataDir() {
     const char* home = getenv("HOME");
@@ -30,7 +31,7 @@ static std::string statePath() {
     const char* home = getenv("HOME");
     std::string d = std::string(home ? home : "/tmp") + "/.notepad-cpp";
     fs::create_directories(d);
-    return d + "/state.txt";  // lines: active_id, then one open id per line
+    return d + "/state.txt";  // line 1: active id, rest: open ids
 }
 
 struct Note {
@@ -41,42 +42,48 @@ struct Note {
 static std::string titleFor(const std::string& content) {
     auto nl = content.find('\n');
     std::string first = content.substr(0, nl == std::string::npos ? 40 : std::min<size_t>(nl, 40));
-    // trim
     size_t a = first.find_first_not_of(" \t\r");
     size_t b = first.find_last_not_of(" \t\r");
     if (a == std::string::npos) return "Untitled";
     return first.substr(a, b - a + 1);
 }
 
+static bool validId(const std::string& nid) {
+    if (nid.empty() || nid.size() > 64) return false;
+    for (char c : nid) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+    }
+    return true;
+}
+
 static std::vector<Note> loadAllNotes() {
     std::vector<Note> out;
-    for (auto& p : fs::directory_iterator(dataDir())) {
+    std::error_code ec;
+    for (auto& p : fs::directory_iterator(dataDir(), ec)) {
         if (p.path().extension() != ".txt") continue;
+        std::string nid = p.path().stem().string();
+        if (!validId(nid)) continue;
         std::ifstream f(p.path());
         std::stringstream ss;
         ss << f.rdbuf();
-        out.push_back({p.path().stem().string(), ss.str()});
+        out.push_back({nid, ss.str()});
     }
     return out;
 }
 
 static void saveNote(const std::string& nid, const std::string& content) {
-    // Validate id (hex only) to block path traversal.
-    for (char c : nid) {
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return;
-    }
+    if (!validId(nid)) return;
     std::string tmp = dataDir() + "/" + nid + ".txt.tmp";
     std::string dst = dataDir() + "/" + nid + ".txt";
     std::ofstream f(tmp, std::ios::trunc);
     f << content;
     f.close();
-    fs::rename(tmp, dst);
+    std::error_code ec;
+    fs::rename(tmp, dst, ec);
 }
 
 static void deleteNote(const std::string& nid) {
-    for (char c : nid) {
-        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return;
-    }
+    if (!validId(nid)) return;
     std::error_code ec;
     fs::remove(dataDir() + "/" + nid + ".txt", ec);
 }
@@ -84,17 +91,25 @@ static void deleteNote(const std::string& nid) {
 static std::string newId() {
     static uint64_t ctr = 0;
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    char buf[32];
+    char buf[40];
     snprintf(buf, sizeof(buf), "%llx%llx", (unsigned long long)now,
              (unsigned long long)(++ctr));
     return std::string(buf);
+}
+
+// NSString <-> std::string helpers
+static inline NSString* S(const std::string& s) {
+    return [NSString stringWithUTF8String:s.c_str()];
+}
+static inline std::string C(NSString* s) {
+    return s ? [s UTF8String] : std::string();
 }
 
 // ---------------------------------------------------------------- app
 
 @interface TabInfo : NSObject
 @property (nonatomic, strong) NSTextView* textView;
-@property (nonatomic) std::string nid;
+@property (nonatomic, copy) NSString* nid;   // NSString, not std::string
 @end
 @implementation TabInfo
 @end
@@ -109,6 +124,7 @@ static std::string newId() {
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     self.tabInfos = [NSMutableArray array];
 
     NSRect frame = NSMakeRect(0, 0, 900, 650);
@@ -121,44 +137,18 @@ static std::string newId() {
     [self.window center];
     [self.window setTitle:@"Notepad"];
     [self.window makeKeyAndOrderFront:nil];
+    [NSApp activateIgnoringOtherApps:YES];
 
-    self.tabs = [[NSTabView alloc] initWithFrame:[self.window.contentView bounds]];
+    self.tabs = [[NSTabView alloc] initWithFrame:[[self.window contentView] bounds]];
     [self.tabs setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
     [self.tabs setDelegate:self];
-    [self.window.contentView addSubview:self.tabs];
+    [[self.window contentView] addSubview:self.tabs];
 
-    // Restore or create first note.
-    self.restoring = YES;
-    std::vector<std::string> openIds;
-    std::string activeId;
-    {
-        std::ifstream f(statePath());
-        std::string line;
-        bool first = true;
-        while (std::getline(f, line)) {
-            if (first) { activeId = line; first = false; }
-            else if (!line.empty()) openIds.push_back(line);
-        }
-    }
-    auto notes = loadAllNotes();
-    // Keep only ids that still exist.
-    std::vector<std::string> valid;
-    for (auto& nid : openIds) {
-        for (auto& n : notes) if (n.nid == nid) { valid.push_back(nid); break; }
-    }
-    if (valid.empty()) {
-        std::string nid = newId();
-        saveNote(nid, "");
-        valid.push_back(nid);
-        activeId = nid;
-    }
-    for (auto& nid : valid) [self addTabWithId:nid select:(nid == activeId)];
-    if ([self.tabs numberOfTabViewItems] > 0 && activeId.empty())
-        [self.tabs selectFirstTabViewItem:nil];
-    self.restoring = NO;
-    [self persistState];
+    [self setupMenu];
+    [self restoreTabs];
+}
 
-    // Menu: Cmd+N new tab, Cmd+W close tab.
+- (void)setupMenu {
     NSMenu* mainMenu = [[NSMenu alloc] init];
     NSMenuItem* appItem = [[NSMenuItem alloc] init];
     [mainMenu addItem:appItem];
@@ -174,12 +164,50 @@ static std::string newId() {
     [NSApp setMainMenu:mainMenu];
 }
 
-- (NSTabViewItem*)addTabWithId:(const std::string&)nid select:(BOOL)select {
-    std::string content;
-    for (auto& n : loadAllNotes()) if (n.nid == nid) { content = n.content; break; }
+- (void)restoreTabs {
+    self.restoring = YES;
 
-    NSTabViewItem* item = [[NSTabViewItem alloc] initWithIdentifier:@(nid.c_str())];
-    [item setLabel:@(titleFor(content).c_str())];
+    std::vector<std::string> openIds;
+    std::string activeId;
+    {
+        std::ifstream f(statePath());
+        std::string line;
+        bool first = true;
+        while (std::getline(f, line)) {
+            if (first) { activeId = line; first = false; }
+            else if (!line.empty() && validId(line)) openIds.push_back(line);
+        }
+    }
+    auto notes = loadAllNotes();
+    std::vector<std::string> valid;
+    for (auto& nid : openIds) {
+        for (auto& n : notes) {
+            if (n.nid == nid) { valid.push_back(nid); break; }
+        }
+    }
+    if (valid.empty()) {
+        std::string nid = newId();
+        saveNote(nid, "");
+        valid.push_back(nid);
+        activeId = nid;
+    }
+    NSString* activeNS = S(activeId);
+    for (auto& nid : valid) {
+        [self addTabWithId:S(nid) select:[S(nid) isEqualToString:activeNS]];
+    }
+    self.restoring = NO;
+    [self persistState];
+}
+
+- (void)addTabWithId:(NSString*)nid select:(BOOL)select {
+    std::string cnid = C(nid);
+    std::string content;
+    for (auto& n : loadAllNotes()) {
+        if (n.nid == cnid) { content = n.content; break; }
+    }
+
+    NSTabViewItem* item = [[NSTabViewItem alloc] initWithIdentifier:nid];
+    [item setLabel:S(titleFor(content))];
 
     NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 900, 620)];
     [scroll setHasVerticalScroller:YES];
@@ -188,7 +216,7 @@ static std::string newId() {
     NSTextView* tv = [[NSTextView alloc] initWithFrame:[scroll bounds]];
     [tv setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
     [tv setFont:[NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular]];
-    [tv setString:@(content.c_str())];
+    [tv setString:S(content)];
     [tv setRichText:NO];
     [tv setImportsGraphics:NO];
     [[tv textStorage] setDelegate:self];
@@ -198,37 +226,23 @@ static std::string newId() {
     info.textView = tv;
     info.nid = nid;
     [self.tabInfos addObject:info];
-    // Tag the text view so the delegate can find its note id.
-    [tv setIdentifier:@(nid.c_str())];
 
     [item setView:scroll];
     [self.tabs addTabViewItem:item];
     if (select) [self.tabs selectTabViewItem:item];
-    return item;
-}
-
-- (TabInfo*)infoForTextView:(NSTextView*)tv {
-    NSString* ident = [tv identifier];
-    for (TabInfo* info in self.tabInfos) {
-        if ([@(info.nid.c_str()) isEqualToString:ident]) return info;
-    }
-    return nil;
 }
 
 // NSTextStorageDelegate — auto-save on every edit.
 - (void)textStorageDidProcessEditing:(NSNotification*)notification {
     if (self.restoring) return;
     NSTextStorage* ts = [notification object];
-    // Find the owning text view via its layout manager.
     for (TabInfo* info in self.tabInfos) {
-        NSTextView* tv = info.textView;
-        if ([tv textStorage] == ts) {
-            std::string content = [[tv string] UTF8String] ?: "";
-            saveNote(info.nid, content);
-            // Update tab label from first line.
-            NSString* label = @(titleFor(content).c_str());
+        if ([[info.textView textStorage] == ts]) {
+            std::string content = C([info.textView string]);
+            saveNote(C(info.nid), content);
+            NSString* label = S(titleFor(content));
             for (NSTabViewItem* item in [self.tabs tabViewItems]) {
-                if ([[item identifier] isEqualToString:@(info.nid.c_str())]) {
+                if ([[item identifier] isEqualToString:info.nid]) {
                     [item setLabel:label];
                     break;
                 }
@@ -241,31 +255,37 @@ static std::string newId() {
 - (void)newTab:(id)sender {
     std::string nid = newId();
     saveNote(nid, "");
-    [self addTabWithId:nid select:YES];
+    [self addTabWithId:S(nid) select:YES];
     [self persistState];
 }
 
 - (void)closeTab:(id)sender {
     NSTabViewItem* item = [self.tabs selectedTabViewItem];
-    if (!item || [self.tabs numberOfTabViewItems] <= 1) return;
-    std::string nid = [[item identifier] UTF8String] ?: "";
+    if (!item || [[self.tabs tabViewItems] count] <= 1) return;
+    NSString* nid = (NSString*)[item identifier];
+    std::string cnid = C(nid);
+
     // Flush current text first.
     for (TabInfo* info in self.tabInfos) {
-        if (info.nid == nid) {
-            std::string content = [[info.textView string] UTF8String] ?: "";
-            saveNote(nid, content);
+        if ([info.nid isEqualToString:nid]) {
+            saveNote(cnid, C([info.textView string]));
             break;
         }
     }
-    // Delete the note only if it is empty (unsaved notes survive).
+    // Delete the note only if empty; non-empty notes survive (can be
+    // reopened — though this simple version has no "reopen" UI, the
+    // file stays on disk and restoreTabs will pick it up if listed).
     bool hasContent = false;
-    for (auto& n : loadAllNotes())
-        if (n.nid == nid && !n.content.empty()) { hasContent = true; break; }
-    if (!hasContent) deleteNote(nid);
-    [self.tabInfos filterUsingPredicate:
-        [NSPredicate predicateWithBlock:^BOOL(TabInfo* info, NSDictionary* b) {
-            return info.nid != nid;
-        }]];
+    for (auto& n : loadAllNotes()) {
+        if (n.nid == cnid && !n.content.empty()) { hasContent = true; break; }
+    }
+    if (!hasContent) deleteNote(cnid);
+
+    NSMutableArray* keep = [NSMutableArray array];
+    for (TabInfo* info in self.tabInfos) {
+        if (![info.nid isEqualToString:nid]) [keep addObject:info];
+    }
+    self.tabInfos = keep;
     [self.tabs removeTabViewItem:item];
     [self persistState];
 }
@@ -273,12 +293,12 @@ static std::string newId() {
 - (void)persistState {
     if (self.restoring) return;
     NSTabViewItem* sel = [self.tabs selectedTabViewItem];
-    std::string active = sel ? ([[sel identifier] UTF8String] ?: "") : "";
+    NSString* active = sel ? (NSString*)[sel identifier] : nil;
     std::ofstream f(statePath(), std::ios::trunc);
-    f << active << "\n";
+    f << C(active) << "\n";
     for (NSTabViewItem* item in [self.tabs tabViewItems]) {
-        std::string nid = [[item identifier] UTF8String] ?: "";
-        if (!nid.empty()) f << nid << "\n";
+        NSString* nid = (NSString*)[item identifier];
+        if (nid) f << C(nid) << "\n";
     }
 }
 

@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 
 echo "Compiling…"
-clang++ -std=c++17 -O2 -framework Cocoa -o "Icecream Notepad" main.mm
+clang++ -std=c++17 -O2 -fobjc-arc -framework Cocoa -framework UniformTypeIdentifiers -o "Icecream Notepad" main.mm
 
 echo "Bundling…"
 rm -rf "Icecream Notepad.app"

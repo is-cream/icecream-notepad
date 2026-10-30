@@ -12,6 +12,7 @@
 // - Cmd+N new tab, Cmd+W close tab.
 
 #import <Cocoa/Cocoa.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -436,7 +437,8 @@ static std::string defaultSaveDir() {
     NSSavePanel* panel = [NSSavePanel savePanel];
     [panel setCanCreateDirectories:YES];
     [panel setAllowsOtherFileTypes:YES];
-    [panel setAllowedFileTypes:@[@"txt"]];
+    UTType* txtType = [UTType typeWithFilenameExtension:@"txt"];
+    if (txtType) [panel setAllowedContentTypes:@[txtType]];
     [panel setDirectoryURL:[NSURL fileURLWithPath:S(defaultSaveDir())]];
 
     // Default name: existing filename, or Untitled.txt

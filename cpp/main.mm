@@ -1,9 +1,13 @@
-// Notepad — native macOS plain-text notes app.
+// Icecream Notepad — native macOS plain-text notes app.
 // Language: Objective-C++ (C++ with Cocoa). Single file.
 // Build: ./build.sh   (needs Xcode Command Line Tools: xcode-select --install)
 //
 // - Plain text only, no formatting (NSTextView, monospace).
-// - Every edit auto-saves to ~/.notepad-cpp/notes/<id>.txt
+// - Every edit auto-saves to ~/.icecream-notepad/notes/<id>.json
+// - Tab title = filename (not first line). Unsaved tabs show "Untitled".
+// - Cmd+S saves to the backing file; if none, acts as Save As.
+// - Cmd+Shift+S / Save As… exports to ~/Documents/Notes/ (.txt default,
+//   any extension allowed).
 // - Open tabs + contents are restored on launch (unsaved notes survive restarts).
 // - Cmd+N new tab, Cmd+W close tab.
 
@@ -20,32 +24,88 @@ namespace fs = std::filesystem;
 // ---------------------------------------------------------------- storage
 // C++ side: std::string throughout. ObjC side: NSString*. Convert at boundary.
 
-static std::string dataDir() {
+static std::string baseDir() {
     const char* home = getenv("HOME");
-    std::string d = std::string(home ? home : "/tmp") + "/.notepad-cpp/notes";
+    std::string d = std::string(home ? home : "/tmp") + "/.icecream-notepad";
+    fs::create_directories(d);
+    return d;
+}
+
+static std::string dataDir() {
+    std::string d = baseDir() + "/notes";
     fs::create_directories(d);
     return d;
 }
 
 static std::string statePath() {
-    const char* home = getenv("HOME");
-    std::string d = std::string(home ? home : "/tmp") + "/.notepad-cpp";
-    fs::create_directories(d);
-    return d + "/state.txt";  // line 1: active id, rest: open ids
+    return baseDir() + "/state.txt";  // line 1: active id, rest: open ids
 }
 
 struct Note {
     std::string nid;
     std::string content;
+    std::string filepath;  // empty = unsaved (no file backing)
 };
 
-static std::string titleFor(const std::string& content) {
-    auto nl = content.find('\n');
-    std::string first = content.substr(0, nl == std::string::npos ? 40 : std::min<size_t>(nl, 40));
-    size_t a = first.find_first_not_of(" \t\r");
-    size_t b = first.find_last_not_of(" \t\r");
-    if (a == std::string::npos) return "Untitled";
-    return first.substr(a, b - a + 1);
+// Minimal JSON for note storage: {"content":"...","filepath":"..."}
+// Content is stored with basic escaping (we control both sides).
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default: out += c;
+        }
+    }
+    return out;
+}
+
+static std::string jsonUnescape(const std::string& s) {
+    std::string out;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[i + 1];
+            if (n == '"') out += '"';
+            else if (n == '\\') out += '\\';
+            else if (n == 'n') out += '\n';
+            else if (n == 'r') out += '\r';
+            else if (n == 't') out += '\t';
+            else { out += s[i]; out += n; }
+            ++i;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
+// Extract "key":"value" (string value only) from a flat JSON object.
+static std::string jsonGet(const std::string& json, const std::string& key) {
+    std::string pat = "\"" + key + "\":\"";
+    auto pos = json.find(pat);
+    if (pos == std::string::npos) return "";
+    pos += pat.size();
+    std::string raw;
+    while (pos < json.size()) {
+        if (json[pos] == '\\' && pos + 1 < json.size()) {
+            raw += json[pos]; raw += json[pos + 1]; pos += 2;
+        } else if (json[pos] == '"') {
+            break;
+        } else {
+            raw += json[pos]; ++pos;
+        }
+    }
+    return jsonUnescape(raw);
+}
+
+static std::string basenameOf(const std::string& path) {
+    auto pos = path.find_last_of("/\\");
+    std::string b = (pos == std::string::npos) ? path : path.substr(pos + 1);
+    return b.empty() ? "Untitled" : b;
 }
 
 static bool validId(const std::string& nid) {
@@ -59,33 +119,60 @@ static bool validId(const std::string& nid) {
 static std::vector<Note> loadAllNotes() {
     std::vector<Note> out;
     std::error_code ec;
+    // Migrate old .txt notes from the pre-JSON layout, once.
+    std::string oldDir = std::string(getenv("HOME") ? getenv("HOME") : "/tmp")
+                       + "/.notepad-cpp/notes";
+    if (fs::exists(oldDir, ec)) {
+        for (auto& p : fs::directory_iterator(oldDir, ec)) {
+            if (p.path().extension() != ".txt") continue;
+            std::string nid = p.path().stem().string();
+            if (!validId(nid)) continue;
+            // Skip if already migrated.
+            if (fs::exists(dataDir() + "/" + nid + ".json", ec)) continue;
+            std::ifstream f(p.path());
+            std::stringstream ss;
+            ss << f.rdbuf();
+            std::string content = ss.str();
+            std::string dst = dataDir() + "/" + nid + ".json";
+            std::ofstream o(dst, std::ios::trunc);
+            o << "{\"content\":\"" << jsonEscape(content) << "\",\"filepath\":\"\"}";
+        }
+    }
     for (auto& p : fs::directory_iterator(dataDir(), ec)) {
-        if (p.path().extension() != ".txt") continue;
+        if (p.path().extension() != ".json") continue;
         std::string nid = p.path().stem().string();
         if (!validId(nid)) continue;
         std::ifstream f(p.path());
         std::stringstream ss;
         ss << f.rdbuf();
-        out.push_back({nid, ss.str()});
+        std::string json = ss.str();
+        out.push_back({nid, jsonGet(json, "content"), jsonGet(json, "filepath")});
     }
     return out;
 }
 
-static void saveNote(const std::string& nid, const std::string& content) {
+static void saveNote(const std::string& nid, const std::string& content,
+                     const std::string& filepath) {
     if (!validId(nid)) return;
-    std::string tmp = dataDir() + "/" + nid + ".txt.tmp";
-    std::string dst = dataDir() + "/" + nid + ".txt";
+    std::string tmp = dataDir() + "/" + nid + ".json.tmp";
+    std::string dst = dataDir() + "/" + nid + ".json";
     std::ofstream f(tmp, std::ios::trunc);
-    f << content;
+    f << "{\"content\":\"" << jsonEscape(content)
+      << "\",\"filepath\":\"" << jsonEscape(filepath) << "\"}";
     f.close();
     std::error_code ec;
     fs::rename(tmp, dst, ec);
+    // If the note has a backing file, write content there too.
+    if (!filepath.empty()) {
+        std::ofstream bf(filepath, std::ios::trunc);
+        if (bf) bf << content;
+    }
 }
 
 static void deleteNote(const std::string& nid) {
     if (!validId(nid)) return;
     std::error_code ec;
-    fs::remove(dataDir() + "/" + nid + ".txt", ec);
+    fs::remove(dataDir() + "/" + nid + ".json", ec);
 }
 
 static std::string newId() {
@@ -105,11 +192,20 @@ static inline std::string C(NSString* s) {
     return s ? [s UTF8String] : std::string();
 }
 
+// Default Save As folder: ~/Documents/Notes
+static std::string defaultSaveDir() {
+    const char* home = getenv("HOME");
+    std::string d = std::string(home ? home : "/tmp") + "/Documents/Notes";
+    std::error_code ec;
+    fs::create_directories(d, ec);
+    return d;
+}
+
 // ---------------------------------------------------------------- app
 
 @interface TabInfo : NSObject
 @property (nonatomic, strong) NSTextView* textView;
-@property (nonatomic, copy) NSString* nid;   // NSString, not std::string
+@property (nonatomic, copy) NSString* nid;
 @end
 @implementation TabInfo
 @end
@@ -135,7 +231,7 @@ static inline std::string C(NSString* s) {
                     backing:NSBackingStoreBuffered
                       defer:NO];
     [self.window center];
-    [self.window setTitle:@"Notepad"];
+    [self.window setTitle:@"Icecream Notepad"];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
@@ -154,7 +250,8 @@ static inline std::string C(NSString* s) {
     [mainMenu addItem:appItem];
     NSMenu* appMenu = [[NSMenu alloc] init];
     [appItem setSubmenu:appMenu];
-    [appMenu addItemWithTitle:@"Quit Notepad" action:@selector(terminate:) keyEquivalent:@"q"];
+    [appMenu addItemWithTitle:@"Quit Icecream Notepad"
+                      action:@selector(terminate:) keyEquivalent:@"q"];
     NSMenuItem* fileItem = [[NSMenuItem alloc] initWithTitle:@"File" action:nil keyEquivalent:@""];
     [mainMenu addItem:fileItem];
     NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
@@ -192,7 +289,7 @@ static inline std::string C(NSString* s) {
     }
     if (valid.empty()) {
         std::string nid = newId();
-        saveNote(nid, "");
+        saveNote(nid, "", "");
         valid.push_back(nid);
         activeId = nid;
     }
@@ -204,15 +301,20 @@ static inline std::string C(NSString* s) {
     [self persistState];
 }
 
+- (NSString*)tabTitleForNote:(const Note&)n {
+    if (!n.filepath.empty()) return S(basenameOf(n.filepath));
+    return @"Untitled";
+}
+
 - (void)addTabWithId:(NSString*)nid select:(BOOL)select {
     std::string cnid = C(nid);
-    std::string content;
+    Note found{"", "", ""};
     for (auto& n : loadAllNotes()) {
-        if (n.nid == cnid) { content = n.content; break; }
+        if (n.nid == cnid) { found = n; break; }
     }
 
     NSTabViewItem* item = [[NSTabViewItem alloc] initWithIdentifier:nid];
-    [item setLabel:S(titleFor(content))];
+    [item setLabel:[self tabTitleForNote:found]];
 
     NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 900, 620)];
     [scroll setHasVerticalScroller:YES];
@@ -221,7 +323,7 @@ static inline std::string C(NSString* s) {
     NSTextView* tv = [[NSTextView alloc] initWithFrame:[scroll bounds]];
     [tv setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
     [tv setFont:[NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular]];
-    [tv setString:S(content)];
+    [tv setString:S(found.content)];
     [tv setRichText:NO];
     [tv setImportsGraphics:NO];
     [[tv textStorage] setDelegate:self];
@@ -237,6 +339,20 @@ static inline std::string C(NSString* s) {
     if (select) [self.tabs selectTabViewItem:item];
 }
 
+- (TabInfo*)infoForId:(NSString*)nid {
+    for (TabInfo* info in self.tabInfos) {
+        if ([info.nid isEqualToString:nid]) return info;
+    }
+    return nil;
+}
+
+- (Note)noteForId:(const std::string&)nid {
+    for (auto& n : loadAllNotes()) {
+        if (n.nid == nid) return n;
+    }
+    return {nid, "", ""};
+}
+
 // NSTextStorageDelegate — auto-save on every edit.
 - (void)textStorageDidProcessEditing:(NSNotification*)notification {
     if (self.restoring) return;
@@ -244,15 +360,11 @@ static inline std::string C(NSString* s) {
     for (TabInfo* info in self.tabInfos) {
         NSTextStorage* tvStorage = [[info textView] textStorage];
         if (tvStorage == ts) {
-            std::string content = C([info.textView string]);
-            saveNote(C(info.nid), content);
-            NSString* label = S(titleFor(content));
-            for (NSTabViewItem* item in [self.tabs tabViewItems]) {
-                if ([[item identifier] isEqualToString:info.nid]) {
-                    [item setLabel:label];
-                    break;
-                }
-            }
+            std::string cnid = C(info.nid);
+            std::string content = C([[info textView] string]);
+            Note n = [self noteForId:cnid];
+            saveNote(cnid, content, n.filepath);
+            // Title is filename-based; no update needed on content change.
             break;
         }
     }
@@ -260,7 +372,7 @@ static inline std::string C(NSString* s) {
 
 - (void)newTab:(id)sender {
     std::string nid = newId();
-    saveNote(nid, "");
+    saveNote(nid, "", "");
     [self addTabWithId:S(nid) select:YES];
     [self persistState];
 }
@@ -271,25 +383,17 @@ static inline std::string C(NSString* s) {
     NSString* nid = (NSString*)[item identifier];
     std::string cnid = C(nid);
 
-    // Flush current text first.
-    for (TabInfo* info in self.tabInfos) {
-        if ([info.nid isEqualToString:nid]) {
-            saveNote(cnid, C([info.textView string]));
-            break;
-        }
-    }
-    // Delete the note only if empty; non-empty notes survive (can be
-    // reopened — though this simple version has no "reopen" UI, the
-    // file stays on disk and restoreTabs will pick it up if listed).
-    bool hasContent = false;
-    for (auto& n : loadAllNotes()) {
-        if (n.nid == cnid && !n.content.empty()) { hasContent = true; break; }
-    }
+    TabInfo* info = [self infoForId:nid];
+    std::string content = info ? C([[info textView] string]) : "";
+    Note n = [self noteForId:cnid];
+    saveNote(cnid, content, n.filepath);
+
+    bool hasContent = !content.empty();
     if (!hasContent) deleteNote(cnid);
 
     NSMutableArray* keep = [NSMutableArray array];
-    for (TabInfo* info in self.tabInfos) {
-        if (![info.nid isEqualToString:nid]) [keep addObject:info];
+    for (TabInfo* i in self.tabInfos) {
+        if (![i.nid isEqualToString:nid]) [keep addObject:i];
     }
     self.tabInfos = keep;
     [self.tabs removeTabViewItem:item];
@@ -299,46 +403,64 @@ static inline std::string C(NSString* s) {
 - (NSString*)currentContent {
     NSTabViewItem* item = [self.tabs selectedTabViewItem];
     if (!item) return @"";
-    NSString* nid = (NSString*)[item identifier];
-    for (TabInfo* info in self.tabInfos) {
-        if ([info.nid isEqualToString:nid]) {
-            return [info.textView string] ?: @"";
-        }
-    }
-    return @"";
+    TabInfo* info = [self infoForId:(NSString*)[item identifier]];
+    return info ? ([[info textView] string] ?: @"") : @"";
 }
 
-- (NSString*)currentTitle {
+- (NSString*)currentNid {
     NSTabViewItem* item = [self.tabs selectedTabViewItem];
-    if (!item) return @"Untitled";
-    return [item label] ?: @"Untitled";
+    return item ? (NSString*)[item identifier] : nil;
 }
 
-// Cmd+S — flush the current note to storage (auto-save already does this;
-// this is for muscle memory and certainty).
+// Cmd+S — save to backing file; if none, behaves as Save As.
 - (void)save:(id)sender {
-    NSTabViewItem* item = [self.tabs selectedTabViewItem];
-    if (!item) return;
-    NSString* nid = (NSString*)[item identifier];
+    NSString* nid = [self currentNid];
+    if (!nid) return;
+    std::string cnid = C(nid);
+    Note n = [self noteForId:cnid];
     std::string content = C([self currentContent]);
-    saveNote(C(nid), content);
+    if (n.filepath.empty()) {
+        [self saveAs:sender];
+        return;
+    }
+    saveNote(cnid, content, n.filepath);
     [self persistState];
 }
 
-// Cmd+Shift+S — export the current note to a user-chosen .txt file.
+// Cmd+Shift+S — Save As… (default ~/Documents/Notes/, .txt or any extension).
 - (void)saveAs:(id)sender {
+    NSString* nid = [self currentNid];
+    if (!nid) return;
     NSString* content = [self currentContent];
-    NSString* title = [self currentTitle];
 
     NSSavePanel* panel = [NSSavePanel savePanel];
-    [panel setAllowedFileTypes:@[@"txt"]];
     [panel setCanCreateDirectories:YES];
-    [panel setNameFieldStringValue:[title stringByAppendingPathExtension:@"txt"] ?: @"Untitled.txt"];
+    [panel setAllowsOtherFileTypes:YES];
+    [panel setAllowedFileTypes:@[@"txt"]];
+    [panel setDirectoryURL:[NSURL fileURLWithPath:S(defaultSaveDir())]];
 
+    // Default name: existing filename, or Untitled.txt
+    std::string cnid = C(nid);
+    Note n = [self noteForId:cnid];
+    NSString* defaultName;
+    if (!n.filepath.empty()) {
+        defaultName = S(basenameOf(n.filepath));
+    } else {
+        defaultName = @"Untitled.txt";
+    }
+    [panel setNameFieldStringValue:defaultName];
+
+    // Capture values for the completion block (avoid self cycle issues).
+    __weak AppDelegate* weakSelf = self;
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSInteger result) {
         if (result != NSModalResponseOK) return;
         NSURL* url = [panel URL];
         if (!url) return;
+        std::string path = C([[url path] stringByStandardizingPath]);
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        // Write the file.
         NSError* err = nil;
         BOOL ok = [content writeToURL:url atomically:YES
                              encoding:NSUTF8StringEncoding error:&err];
@@ -347,7 +469,14 @@ static inline std::string C(NSString* s) {
             [alert setMessageText:@"Could not save file"];
             [alert setInformativeText:[err localizedDescription] ?: @"Unknown error"];
             [alert runModal];
+            return;
         }
+        // Bind the note to this file; update tab title to the filename.
+        std::string cur = C([strongSelf currentContent]);
+        saveNote(cnid, cur, path);
+        [strongSelf persistState];
+        NSTabViewItem* item = [strongSelf.tabs selectedTabViewItem];
+        if (item) [item setLabel:S(basenameOf(path))];
     }];
 }
 

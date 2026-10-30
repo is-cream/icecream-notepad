@@ -160,6 +160,11 @@ static inline std::string C(NSString* s) {
     NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
     [fileItem setSubmenu:fileMenu];
     [fileMenu addItemWithTitle:@"New Tab" action:@selector(newTab:) keyEquivalent:@"n"];
+    [fileMenu addItemWithTitle:@"Save" action:@selector(save:) keyEquivalent:@"s"];
+    NSMenuItem* saveAs = [fileMenu addItemWithTitle:@"Save As…"
+                                             action:@selector(saveAs:)
+                                      keyEquivalent:@"S"];
+    [saveAs setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
     [fileMenu addItemWithTitle:@"Close Tab" action:@selector(closeTab:) keyEquivalent:@"w"];
     [NSApp setMainMenu:mainMenu];
 }
@@ -289,6 +294,61 @@ static inline std::string C(NSString* s) {
     self.tabInfos = keep;
     [self.tabs removeTabViewItem:item];
     [self persistState];
+}
+
+- (NSString*)currentContent {
+    NSTabViewItem* item = [self.tabs selectedTabViewItem];
+    if (!item) return @"";
+    NSString* nid = (NSString*)[item identifier];
+    for (TabInfo* info in self.tabInfos) {
+        if ([info.nid isEqualToString:nid]) {
+            return [info.textView string] ?: @"";
+        }
+    }
+    return @"";
+}
+
+- (NSString*)currentTitle {
+    NSTabViewItem* item = [self.tabs selectedTabViewItem];
+    if (!item) return @"Untitled";
+    return [item label] ?: @"Untitled";
+}
+
+// Cmd+S — flush the current note to storage (auto-save already does this;
+// this is for muscle memory and certainty).
+- (void)save:(id)sender {
+    NSTabViewItem* item = [self.tabs selectedTabViewItem];
+    if (!item) return;
+    NSString* nid = (NSString*)[item identifier];
+    std::string content = C([self currentContent]);
+    saveNote(C(nid), content);
+    [self persistState];
+}
+
+// Cmd+Shift+S — export the current note to a user-chosen .txt file.
+- (void)saveAs:(id)sender {
+    NSString* content = [self currentContent];
+    NSString* title = [self currentTitle];
+
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    [panel setAllowedFileTypes:@[@"txt"]];
+    [panel setCanCreateDirectories:YES];
+    [panel setNameFieldStringValue:[title stringByAppendingPathExtension:@"txt"] ?: @"Untitled.txt"];
+
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSInteger result) {
+        if (result != NSModalResponseOK) return;
+        NSURL* url = [panel URL];
+        if (!url) return;
+        NSError* err = nil;
+        BOOL ok = [content writeToURL:url atomically:YES
+                             encoding:NSUTF8StringEncoding error:&err];
+        if (!ok) {
+            NSAlert* alert = [[NSAlert alloc] init];
+            [alert setMessageText:@"Could not save file"];
+            [alert setInformativeText:[err localizedDescription] ?: @"Unknown error"];
+            [alert runModal];
+        }
+    }];
 }
 
 - (void)persistState {

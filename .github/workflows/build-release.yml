@@ -1,0 +1,30 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app
+        run: |
+          cd cpp
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Zip app
+        run: |
+          cd cpp
+          ditto -c -k --sequesterRsrc --keepParent "Icecream Notepad.app" "IcecreamNotepad-mac.zip"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: cpp/IcecreamNotepad-mac.zip
+          generate_release_notes: true

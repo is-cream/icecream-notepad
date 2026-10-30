@@ -297,6 +297,23 @@ static const CGFloat kTabBarHeight = 34.0;
     [saveAs setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
     [fileMenu addItemWithTitle:@"Close Tab" action:@selector(closeTab:) keyEquivalent:@"w"];
     [NSApp setMainMenu:mainMenu];
+
+    // Edit menu — NSTextView handles these via the responder chain;
+    // the items just need to exist for the shortcuts to work.
+    NSMenuItem* editItem = [[NSMenuItem alloc] initWithTitle:@"Edit" action:nil keyEquivalent:@""];
+    [mainMenu addItem:editItem];
+    NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editItem setSubmenu:editMenu];
+    [editMenu addItemWithTitle:@"Undo" action:@selector(undo:) keyEquivalent:@"z"];
+    NSMenuItem* redo = [editMenu addItemWithTitle:@"Redo"
+                                          action:@selector(redo:)
+                                   keyEquivalent:@"Z"];
+    [redo setKeyEquivalentModifierMask:(NSEventModifierFlagCommand | NSEventModifierFlagShift)];
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItemWithTitle:@"Cut" action:@selector(cut:) keyEquivalent:@"x"];
+    [editMenu addItemWithTitle:@"Copy" action:@selector(copy:) keyEquivalent:@"c"];
+    [editMenu addItemWithTitle:@"Paste" action:@selector(paste:) keyEquivalent:@"v"];
+    [editMenu addItemWithTitle:@"Select All" action:@selector(selectAll:) keyEquivalent:@"a"];
 }
 
 // ---------------------------------------------------------------- notes

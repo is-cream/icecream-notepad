@@ -203,26 +203,26 @@ static std::string defaultSaveDir() {
 }
 
 // ---------------------------------------------------------------- app
+// Custom left-aligned tab bar (NSStackView) + single NSTextView.
+// Tabs pack from the leading edge, exactly like Windows Notepad.
 
-@interface TabInfo : NSObject
-@property (nonatomic, strong) NSTextView* textView;
-@property (nonatomic, copy) NSString* nid;
-@end
-@implementation TabInfo
-@end
-
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSTextStorageDelegate, NSTabViewDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSTextStorageDelegate>
 @property (nonatomic, strong) NSWindow* window;
-@property (nonatomic, strong) NSTabView* tabs;
-@property (nonatomic, strong) NSMutableArray<TabInfo*>* tabInfos;
+@property (nonatomic, strong) NSStackView* tabBar;
+@property (nonatomic, strong) NSScrollView* scroll;
+@property (nonatomic, strong) NSTextView* textView;
+@property (nonatomic, strong) NSMutableArray<NSString*>* openIds;  // ordered
+@property (nonatomic, copy) NSString* activeId;
 @property (nonatomic) BOOL restoring;
 @end
 
 @implementation AppDelegate
 
+static const CGFloat kTabBarHeight = 34.0;
+
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-    self.tabInfos = [NSMutableArray array];
+    self.openIds = [NSMutableArray array];
 
     NSRect frame = NSMakeRect(0, 0, 900, 650);
     self.window = [[NSWindow alloc]
@@ -236,10 +236,33 @@ static std::string defaultSaveDir() {
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
-    self.tabs = [[NSTabView alloc] initWithFrame:[[self.window contentView] bounds]];
-    [self.tabs setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
-    [self.tabs setDelegate:self];
-    [[self.window contentView] addSubview:self.tabs];
+    NSView* content = [self.window contentView];
+    NSRect cb = [content bounds];
+
+    // Tab bar: horizontal stack, views pack from the LEADING edge (left).
+    self.tabBar = [[NSStackView alloc] initWithFrame:
+        NSMakeRect(0, cb.size.height - kTabBarHeight, cb.size.width, kTabBarHeight)];
+    [self.tabBar setOrientation:NSUserInterfaceLayoutOrientationHorizontal];
+    [self.tabBar setSpacing:2.0];
+    [self.tabBar setAlignment:NSLayoutAttributeCenterY];
+    [self.tabBar setDistribution:NSStackViewDistributionGravityAreas];
+    [self.tabBar setAutoresizingMask:(NSViewWidthSizable | NSViewMinYMargin)];
+    [content addSubview:self.tabBar];
+
+    // Single text view below the tab bar.
+    self.scroll = [[NSScrollView alloc] initWithFrame:
+        NSMakeRect(0, 0, cb.size.width, cb.size.height - kTabBarHeight)];
+    [self.scroll setHasVerticalScroller:YES];
+    [self.scroll setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+
+    self.textView = [[NSTextView alloc] initWithFrame:[self.scroll bounds]];
+    [self.textView setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
+    [self.textView setFont:[NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular]];
+    [self.textView setRichText:NO];
+    [self.textView setImportsGraphics:NO];
+    [[self.textView textStorage] setDelegate:self];
+    [self.scroll setDocumentView:self.textView];
+    [content addSubview:self.scroll];
 
     [self setupMenu];
     [self restoreTabs];
@@ -267,6 +290,133 @@ static std::string defaultSaveDir() {
     [NSApp setMainMenu:mainMenu];
 }
 
+// ---------------------------------------------------------------- notes
+
+- (Note)noteForId:(NSString*)nid {
+    std::string cnid = C(nid);
+    for (auto& n : loadAllNotes()) {
+        if (n.nid == cnid) return n;
+    }
+    return {cnid, "", ""};
+}
+
+- (NSString*)titleForId:(NSString*)nid {
+    Note n = [self noteForId:nid];
+    if (!n.filepath.empty()) return S(basenameOf(n.filepath));
+    return @"Untitled";
+}
+
+- (void)flushActive {
+    if (!self.activeId || self.restoring) return;
+    Note n = [self noteForId:self.activeId];
+    saveNote(C(self.activeId), C([self.textView string]), n.filepath);
+}
+
+// ---------------------------------------------------------------- tab bar
+
+- (NSView*)tabViewForId:(NSString*)nid active:(BOOL)active {
+    NSString* title = [self titleForId:nid];
+
+    NSButton* label = [NSButton buttonWithTitle:title target:self
+                                        action:@selector(tabClicked:)];
+    [label setIdentifier:nid];
+    [label setBordered:NO];
+    [label setFont:active
+        ? [NSFont boldSystemFontOfSize:13]
+        : [NSFont systemFontOfSize:13]];
+
+    NSButton* x = [NSButton buttonWithTitle:@"×" target:self
+                                    action:@selector(tabCloseClicked:)];
+    [x setIdentifier:nid];
+    [x setBordered:NO];
+    [x setFont:[NSFont systemFontOfSize:13]];
+
+    NSStackView* tab = [[NSStackView alloc] init];
+    [tab setOrientation:NSUserInterfaceLayoutOrientationHorizontal];
+    [tab setSpacing:0];
+    [tab setAlignment:NSLayoutAttributeCenterY];
+    [tab addArrangedSubview:label];
+    [tab addArrangedSubview:x];
+    [tab setWantsLayer:YES];
+    if (active) {
+        [[tab layer] setBackgroundColor:[[NSColor controlBackgroundColor] CGColor]];
+    }
+    // Rounded tab look.
+    [[tab layer] setCornerRadius:6.0];
+    return tab;
+}
+
+- (void)rebuildTabBar {
+    for (NSView* v in [[self.tabBar arrangedSubviews] copy]) {
+        [self.tabBar removeArrangedSubview:v];
+        [v removeFromSuperview];
+    }
+    for (NSString* nid in self.openIds) {
+        [self.tabBar addArrangedSubview:
+            [self tabViewForId:nid active:[nid isEqualToString:self.activeId]]];
+    }
+    NSButton* plus = [NSButton buttonWithTitle:@"+" target:self
+                                       action:@selector(newTab:)];
+    [plus setBordered:NO];
+    [plus setFont:[NSFont systemFontOfSize:16]];
+    [self.tabBar addArrangedSubview:plus];
+}
+
+- (void)selectTab:(NSString*)nid {
+    if (!nid) return;
+    [self flushActive];
+    self.activeId = nid;
+    Note n = [self noteForId:nid];
+    self.restoring = YES;
+    [self.textView setString:S(n.content)];
+    self.restoring = NO;
+    [self rebuildTabBar];
+    [self persistState];
+}
+
+- (void)tabClicked:(NSButton*)sender {
+    NSString* nid = [sender identifier];
+    if (nid && ![nid isEqualToString:self.activeId]) [self selectTab:nid];
+}
+
+- (void)tabCloseClicked:(NSButton*)sender {
+    NSString* nid = [sender identifier];
+    if (!nid) return;
+    if ([nid isEqualToString:self.activeId]) {
+        [self closeTab:nil];
+    } else {
+        // Close a background tab: flush is unnecessary (it was flushed on switch).
+        Note n = [self noteForId:nid];
+        if (n.content.empty()) deleteNote(C(nid));
+        [self.openIds removeObject:nid];
+        [self rebuildTabBar];
+        [self persistState];
+    }
+}
+
+- (void)newTab:(id)sender {
+    [self flushActive];
+    std::string nid = newId();
+    saveNote(nid, "", "");
+    [self.openIds addObject:S(nid)];
+    [self selectTab:S(nid)];
+}
+
+- (void)closeTab:(id)sender {
+    if ([self.openIds count] <= 1) return;
+    NSString* nid = self.activeId;
+    [self flushActive];
+    Note n = [self noteForId:nid];
+    if (n.content.empty()) deleteNote(C(nid));
+    NSUInteger idx = [self.openIds indexOfObject:nid];
+    [self.openIds removeObject:nid];
+    // Select a neighbor.
+    NSUInteger next = idx < [self.openIds count] ? idx : [self.openIds count] - 1;
+    [self selectTab:self.openIds[next]];
+}
+
+// ---------------------------------------------------------------- restore
+
 - (void)restoreTabs {
     self.restoring = YES;
 
@@ -282,157 +432,57 @@ static std::string defaultSaveDir() {
         }
     }
     auto notes = loadAllNotes();
-    std::vector<std::string> valid;
+    [self.openIds removeAllObjects];
     for (auto& nid : openIds) {
         for (auto& n : notes) {
-            if (n.nid == nid) { valid.push_back(nid); break; }
+            if (n.nid == nid) { [self.openIds addObject:S(nid)]; break; }
         }
     }
-    if (valid.empty()) {
+    if ([self.openIds count] == 0) {
         std::string nid = newId();
         saveNote(nid, "", "");
-        valid.push_back(nid);
+        [self.openIds addObject:S(nid)];
         activeId = nid;
     }
     NSString* activeNS = S(activeId);
-    for (auto& nid : valid) {
-        [self addTabWithId:S(nid) select:[S(nid) isEqualToString:activeNS]];
-    }
+    NSString* toSelect = [self.openIds containsObject:activeNS] ? activeNS : self.openIds[0];
     self.restoring = NO;
-    [self persistState];
-}
-
-- (NSString*)tabTitleForNote:(const Note&)n {
-    if (!n.filepath.empty()) return S(basenameOf(n.filepath));
-    return @"Untitled";
-}
-
-- (void)addTabWithId:(NSString*)nid select:(BOOL)select {
-    std::string cnid = C(nid);
-    Note found{"", "", ""};
-    for (auto& n : loadAllNotes()) {
-        if (n.nid == cnid) { found = n; break; }
-    }
-
-    NSTabViewItem* item = [[NSTabViewItem alloc] initWithIdentifier:nid];
-    [item setLabel:[self tabTitleForNote:found]];
-
-    NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 900, 620)];
-    [scroll setHasVerticalScroller:YES];
-    [scroll setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
-
-    NSTextView* tv = [[NSTextView alloc] initWithFrame:[scroll bounds]];
-    [tv setAutoresizingMask:(NSViewWidthSizable | NSViewHeightSizable)];
-    [tv setFont:[NSFont monospacedSystemFontOfSize:14 weight:NSFontWeightRegular]];
-    [tv setString:S(found.content)];
-    [tv setRichText:NO];
-    [tv setImportsGraphics:NO];
-    [[tv textStorage] setDelegate:self];
-    [scroll setDocumentView:tv];
-
-    TabInfo* info = [[TabInfo alloc] init];
-    info.textView = tv;
-    info.nid = nid;
-    [self.tabInfos addObject:info];
-
-    [item setView:scroll];
-    [self.tabs addTabViewItem:item];
-    if (select) [self.tabs selectTabViewItem:item];
-}
-
-- (TabInfo*)infoForId:(NSString*)nid {
-    for (TabInfo* info in self.tabInfos) {
-        if ([info.nid isEqualToString:nid]) return info;
-    }
-    return nil;
-}
-
-- (Note)noteForId:(const std::string&)nid {
-    for (auto& n : loadAllNotes()) {
-        if (n.nid == nid) return n;
-    }
-    return {nid, "", ""};
+    [self selectTab:toSelect];
 }
 
 // NSTextStorageDelegate — auto-save on every edit.
 - (void)textStorageDidProcessEditing:(NSNotification*)notification {
+    [self flushActive];
+}
+
+- (void)persistState {
     if (self.restoring) return;
-    NSTextStorage* ts = [notification object];
-    for (TabInfo* info in self.tabInfos) {
-        NSTextStorage* tvStorage = [[info textView] textStorage];
-        if (tvStorage == ts) {
-            std::string cnid = C(info.nid);
-            std::string content = C([[info textView] string]);
-            Note n = [self noteForId:cnid];
-            saveNote(cnid, content, n.filepath);
-            // Title is filename-based; no update needed on content change.
-            break;
-        }
+    std::ofstream f(statePath(), std::ios::trunc);
+    f << C(self.activeId) << "\n";
+    for (NSString* nid in self.openIds) {
+        f << C(nid) << "\n";
     }
 }
 
-- (void)newTab:(id)sender {
-    std::string nid = newId();
-    saveNote(nid, "", "");
-    [self addTabWithId:S(nid) select:YES];
-    [self persistState];
-}
-
-- (void)closeTab:(id)sender {
-    NSTabViewItem* item = [self.tabs selectedTabViewItem];
-    if (!item || [[self.tabs tabViewItems] count] <= 1) return;
-    NSString* nid = (NSString*)[item identifier];
-    std::string cnid = C(nid);
-
-    TabInfo* info = [self infoForId:nid];
-    std::string content = info ? C([[info textView] string]) : "";
-    Note n = [self noteForId:cnid];
-    saveNote(cnid, content, n.filepath);
-
-    bool hasContent = !content.empty();
-    if (!hasContent) deleteNote(cnid);
-
-    NSMutableArray* keep = [NSMutableArray array];
-    for (TabInfo* i in self.tabInfos) {
-        if (![i.nid isEqualToString:nid]) [keep addObject:i];
-    }
-    self.tabInfos = keep;
-    [self.tabs removeTabViewItem:item];
-    [self persistState];
-}
-
-- (NSString*)currentContent {
-    NSTabViewItem* item = [self.tabs selectedTabViewItem];
-    if (!item) return @"";
-    TabInfo* info = [self infoForId:(NSString*)[item identifier]];
-    return info ? ([[info textView] string] ?: @"") : @"";
-}
-
-- (NSString*)currentNid {
-    NSTabViewItem* item = [self.tabs selectedTabViewItem];
-    return item ? (NSString*)[item identifier] : nil;
-}
+// ---------------------------------------------------------------- save
 
 // Cmd+S — save to backing file; if none, behaves as Save As.
 - (void)save:(id)sender {
-    NSString* nid = [self currentNid];
-    if (!nid) return;
-    std::string cnid = C(nid);
-    Note n = [self noteForId:cnid];
-    std::string content = C([self currentContent]);
+    if (!self.activeId) return;
+    Note n = [self noteForId:self.activeId];
     if (n.filepath.empty()) {
         [self saveAs:sender];
         return;
     }
-    saveNote(cnid, content, n.filepath);
+    [self flushActive];
     [self persistState];
 }
 
 // Cmd+Shift+S — Save As… (default ~/Documents/Notes/, .txt or any extension).
 - (void)saveAs:(id)sender {
-    NSString* nid = [self currentNid];
-    if (!nid) return;
-    NSString* content = [self currentContent];
+    if (!self.activeId) return;
+    NSString* content = [self.textView string] ?: @"";
+    NSString* nid = self.activeId;
 
     NSSavePanel* panel = [NSSavePanel savePanel];
     [panel setCanCreateDirectories:YES];
@@ -441,18 +491,12 @@ static std::string defaultSaveDir() {
     if (txtType) [panel setAllowedContentTypes:@[txtType]];
     [panel setDirectoryURL:[NSURL fileURLWithPath:S(defaultSaveDir())]];
 
-    // Default name: existing filename, or Untitled.txt
-    std::string cnid = C(nid);
-    Note n = [self noteForId:cnid];
-    NSString* defaultName;
-    if (!n.filepath.empty()) {
-        defaultName = S(basenameOf(n.filepath));
-    } else {
-        defaultName = @"Untitled.txt";
-    }
+    Note n = [self noteForId:nid];
+    NSString* defaultName = n.filepath.empty()
+        ? @"Untitled.txt"
+        : S(basenameOf(n.filepath));
     [panel setNameFieldStringValue:defaultName];
 
-    // Capture values for the completion block (avoid self cycle issues).
     __weak AppDelegate* weakSelf = self;
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSInteger result) {
         if (result != NSModalResponseOK) return;
@@ -462,7 +506,6 @@ static std::string defaultSaveDir() {
         AppDelegate* strongSelf = weakSelf;
         if (!strongSelf) return;
 
-        // Write the file.
         NSError* err = nil;
         BOOL ok = [content writeToURL:url atomically:YES
                              encoding:NSUTF8StringEncoding error:&err];
@@ -473,29 +516,11 @@ static std::string defaultSaveDir() {
             [alert runModal];
             return;
         }
-        // Bind the note to this file; update tab title to the filename.
-        std::string cur = C([strongSelf currentContent]);
-        saveNote(cnid, cur, path);
+        // Bind the note to this file and refresh the tab title.
+        saveNote(C(nid), C(content), path);
+        [strongSelf rebuildTabBar];
         [strongSelf persistState];
-        NSTabViewItem* item = [strongSelf.tabs selectedTabViewItem];
-        if (item) [item setLabel:S(basenameOf(path))];
     }];
-}
-
-- (void)persistState {
-    if (self.restoring) return;
-    NSTabViewItem* sel = [self.tabs selectedTabViewItem];
-    NSString* active = sel ? (NSString*)[sel identifier] : nil;
-    std::ofstream f(statePath(), std::ios::trunc);
-    f << C(active) << "\n";
-    for (NSTabViewItem* item in [self.tabs tabViewItems]) {
-        NSString* nid = (NSString*)[item identifier];
-        if (nid) f << C(nid) << "\n";
-    }
-}
-
-- (void)tabView:(NSTabView*)tv didSelectTabViewItem:(NSTabViewItem*)item {
-    [self persistState];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app {

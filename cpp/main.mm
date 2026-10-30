@@ -46,6 +46,7 @@ struct Note {
     std::string nid;
     std::string content;
     std::string filepath;  // empty = unsaved (no file backing)
+    std::string title;     // display title: "Untitled N" or filename
 };
 
 // Minimal JSON for note storage: {"content":"...","filepath":"..."}
@@ -136,7 +137,8 @@ static std::vector<Note> loadAllNotes() {
             std::string content = ss.str();
             std::string dst = dataDir() + "/" + nid + ".json";
             std::ofstream o(dst, std::ios::trunc);
-            o << "{\"content\":\"" << jsonEscape(content) << "\",\"filepath\":\"\"}";
+            o << "{\"content\":\"" << jsonEscape(content)
+              << "\",\"filepath\":\"\",\"title\":\"Untitled\"}";
         }
     }
     for (auto& p : fs::directory_iterator(dataDir(), ec)) {
@@ -147,19 +149,25 @@ static std::vector<Note> loadAllNotes() {
         std::stringstream ss;
         ss << f.rdbuf();
         std::string json = ss.str();
-        out.push_back({nid, jsonGet(json, "content"), jsonGet(json, "filepath")});
+        std::string title = jsonGet(json, "title");
+        std::string filepath = jsonGet(json, "filepath");
+        if (title.empty()) {
+            title = filepath.empty() ? "Untitled" : basenameOf(filepath);
+        }
+        out.push_back({nid, jsonGet(json, "content"), filepath, title});
     }
     return out;
 }
 
 static void saveNote(const std::string& nid, const std::string& content,
-                     const std::string& filepath) {
+                     const std::string& filepath, const std::string& title) {
     if (!validId(nid)) return;
     std::string tmp = dataDir() + "/" + nid + ".json.tmp";
     std::string dst = dataDir() + "/" + nid + ".json";
     std::ofstream f(tmp, std::ios::trunc);
     f << "{\"content\":\"" << jsonEscape(content)
-      << "\",\"filepath\":\"" << jsonEscape(filepath) << "\"}";
+      << "\",\"filepath\":\"" << jsonEscape(filepath)
+      << "\",\"title\":\"" << jsonEscape(title) << "\"}";
     f.close();
     std::error_code ec;
     fs::rename(tmp, dst, ec);
@@ -214,6 +222,7 @@ static std::string defaultSaveDir() {
 @property (nonatomic, strong) NSMutableArray<NSString*>* openIds;  // ordered
 @property (nonatomic, copy) NSString* activeId;
 @property (nonatomic) BOOL restoring;
+@property (nonatomic) int nextUntitled;  // increments; persisted in state file
 @end
 
 @implementation AppDelegate
@@ -297,22 +306,28 @@ static const CGFloat kTabBarHeight = 34.0;
     for (auto& n : loadAllNotes()) {
         if (n.nid == cnid) return n;
     }
-    return {cnid, "", ""};
+    return {cnid, "", "", "Untitled"};
 }
 
 - (NSString*)titleForId:(NSString*)nid {
     Note n = [self noteForId:nid];
-    if (!n.filepath.empty()) return S(basenameOf(n.filepath));
-    return @"Untitled";
+    return S(n.title);
 }
 
 - (void)flushActive {
     if (!self.activeId || self.restoring) return;
     Note n = [self noteForId:self.activeId];
-    saveNote(C(self.activeId), C([self.textView string]), n.filepath);
+    saveNote(C(self.activeId), C([self.textView string]), n.filepath, n.title);
+}
+
+- (NSString*)nextUntitledTitle {
+    NSString* t = [NSString stringWithFormat:@"Untitled %d", self.nextUntitled++];
+    [self persistState];  // persist the bumped counter
+    return t;
 }
 
 // ---------------------------------------------------------------- tab bar
+// Chrome-style tabs: rounded top corners, active tab blends into content.
 
 - (NSView*)tabViewForId:(NSString*)nid active:(BOOL)active {
     NSString* title = [self titleForId:nid];
@@ -324,25 +339,31 @@ static const CGFloat kTabBarHeight = 34.0;
     [label setFont:active
         ? [NSFont boldSystemFontOfSize:13]
         : [NSFont systemFontOfSize:13]];
+    [label setContentHuggingPriority:NSLayoutPriorityDefaultHigh
+                     forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     NSButton* x = [NSButton buttonWithTitle:@"×" target:self
                                     action:@selector(tabCloseClicked:)];
     [x setIdentifier:nid];
     [x setBordered:NO];
-    [x setFont:[NSFont systemFontOfSize:13]];
+    [x setFont:[NSFont systemFontOfSize:14]];
 
     NSStackView* tab = [[NSStackView alloc] init];
     [tab setOrientation:NSUserInterfaceLayoutOrientationHorizontal];
-    [tab setSpacing:0];
+    [tab setSpacing:4];
     [tab setAlignment:NSLayoutAttributeCenterY];
+    [tab setEdgeInsets:NSEdgeInsetsMake(5, 14, 5, 10)];
     [tab addArrangedSubview:label];
     [tab addArrangedSubview:x];
     [tab setWantsLayer:YES];
-    if (active) {
-        [[tab layer] setBackgroundColor:[[NSColor controlBackgroundColor] CGColor]];
-    }
-    // Rounded tab look.
-    [[tab layer] setCornerRadius:6.0];
+    CALayer* layer = [tab layer];
+    [layer setCornerRadius:9.0];
+    // Round only the TOP corners (like Chrome tabs).
+    [layer setMaskedCorners:kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner];
+    [layer setMasksToBounds:YES];
+    [layer setBackgroundColor:active
+        ? [[NSColor textBackgroundColor] CGColor]
+        : [[NSColor windowBackgroundColor] CGColor]];
     return tab;
 }
 
@@ -355,10 +376,14 @@ static const CGFloat kTabBarHeight = 34.0;
         [self.tabBar addArrangedSubview:
             [self tabViewForId:nid active:[nid isEqualToString:self.activeId]]];
     }
+    // Chrome-style + button.
     NSButton* plus = [NSButton buttonWithTitle:@"+" target:self
                                        action:@selector(newTab:)];
     [plus setBordered:NO];
-    [plus setFont:[NSFont systemFontOfSize:16]];
+    [plus setFont:[NSFont systemFontOfSize:18]];
+    [plus setWantsLayer:YES];
+    [[plus layer] setCornerRadius:11.0];
+    [[plus layer] setMasksToBounds:YES];
     [self.tabBar addArrangedSubview:plus];
 }
 
@@ -381,54 +406,119 @@ static const CGFloat kTabBarHeight = 34.0;
 
 - (void)tabCloseClicked:(NSButton*)sender {
     NSString* nid = [sender identifier];
-    if (!nid) return;
-    if ([nid isEqualToString:self.activeId]) {
-        [self closeTab:nil];
-    } else {
-        // Close a background tab: flush is unnecessary (it was flushed on switch).
-        Note n = [self noteForId:nid];
-        if (n.content.empty()) deleteNote(C(nid));
-        [self.openIds removeObject:nid];
-        [self rebuildTabBar];
-        [self persistState];
-    }
+    [self attemptCloseTab:nid];
 }
 
 - (void)newTab:(id)sender {
     [self flushActive];
     std::string nid = newId();
-    saveNote(nid, "", "");
+    std::string title = C([self nextUntitledTitle]);
+    saveNote(nid, "", "", title);
     [self.openIds addObject:S(nid)];
     [self selectTab:S(nid)];
 }
 
-- (void)closeTab:(id)sender {
-    if ([self.openIds count] <= 1) return;
-    NSString* nid = self.activeId;
-    [self flushActive];
+// Actually remove the tab: delete note if discarding/empty, pick next tab,
+// or open a fresh untitled tab if none remain.
+- (void)doCloseTab:(NSString*)nid discard:(BOOL)discard {
     Note n = [self noteForId:nid];
-    if (n.content.empty()) deleteNote(C(nid));
+    std::string content;
+    if ([nid isEqualToString:self.activeId]) {
+        content = C([self.textView string]);
+    } else {
+        content = n.content;
+    }
+    if (discard || content.empty()) deleteNote(C(nid));
+
     NSUInteger idx = [self.openIds indexOfObject:nid];
     [self.openIds removeObject:nid];
-    // Select a neighbor.
-    NSUInteger next = idx < [self.openIds count] ? idx : [self.openIds count] - 1;
-    [self selectTab:self.openIds[next]];
+
+    if ([self.openIds count] == 0) {
+        // Last tab closed: open a fresh untitled tab.
+        std::string nnid = newId();
+        std::string title = C([self nextUntitledTitle]);
+        saveNote(nnid, "", "", title);
+        [self.openIds addObject:S(nnid)];
+        [self selectTab:S(nnid)];
+        return;
+    }
+    if ([nid isEqualToString:self.activeId]) {
+        NSUInteger next = idx < [self.openIds count] ? idx : [self.openIds count] - 1;
+        [self selectTab:self.openIds[next]];
+    } else {
+        [self rebuildTabBar];
+        [self persistState];
+    }
+}
+
+// Close with save/discard/cancel when the note has unsaved content
+// (content but no file backing).
+- (void)attemptCloseTab:(NSString*)nid {
+    if (!nid) return;
+    [self flushActive];
+    Note n = [self noteForId:nid];
+    std::string content = [nid isEqualToString:self.activeId]
+        ? C([self.textView string]) : n.content;
+    BOOL needsPrompt = n.filepath.empty() && !content.empty();
+    if (!needsPrompt) {
+        [self doCloseTab:nid discard:NO];
+        return;
+    }
+    NSAlert* alert = [[NSAlert alloc] init];
+    [alert setMessageText:[NSString stringWithFormat:
+        @"Do you want to save the changes you made to %@?", S(n.title)]];
+    [alert setInformativeText:@"Your changes will be lost if you don't save them."];
+    [alert addButtonWithTitle:@"Save"];
+    [alert addButtonWithTitle:@"Don't Save"];
+    [alert addButtonWithTitle:@"Cancel"];
+    __weak AppDelegate* weakSelf = self;
+    [alert beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        AppDelegate* strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (response == NSAlertFirstButtonReturn) {
+            // Save → Save As flow, then close.
+            [strongSelf saveAsContent:S(content) forId:nid completion:^(BOOL saved) {
+                if (saved) [strongSelf doCloseTab:nid discard:NO];
+            }];
+        } else if (response == NSAlertSecondButtonReturn) {
+            [strongSelf doCloseTab:nid discard:YES];
+        }
+        // Cancel: stay.
+    }];
+}
+
+- (void)closeTab:(id)sender {
+    [self attemptCloseTab:self.activeId];
 }
 
 // ---------------------------------------------------------------- restore
 
 - (void)restoreTabs {
     self.restoring = YES;
+    self.nextUntitled = 1;
 
     std::vector<std::string> openIds;
     std::string activeId;
     {
         std::ifstream f(statePath());
         std::string line;
-        bool first = true;
+        int lineno = 0;
         while (std::getline(f, line)) {
-            if (first) { activeId = line; first = false; }
+            if (lineno == 0) {
+                activeId = line;
+            } else if (lineno == 1) {
+                // New format: line 2 is the untitled counter (short decimal).
+                // Old format: line 2 is a note id (long hex). Distinguish by shape.
+                bool allDigits = !line.empty();
+                for (char c : line) if (c < '0' || c > '9') allDigits = false;
+                if (allDigits && line.size() <= 6) {
+                    self.nextUntitled = std::max(1, atoi(line.c_str()));
+                } else if (!line.empty() && validId(line)) {
+                    openIds.push_back(line);
+                }
+            }
             else if (!line.empty() && validId(line)) openIds.push_back(line);
+            ++lineno;
         }
     }
     auto notes = loadAllNotes();
@@ -440,7 +530,8 @@ static const CGFloat kTabBarHeight = 34.0;
     }
     if ([self.openIds count] == 0) {
         std::string nid = newId();
-        saveNote(nid, "", "");
+        std::string title = C([self nextUntitledTitle]);
+        saveNote(nid, "", "", title);
         [self.openIds addObject:S(nid)];
         activeId = nid;
     }
@@ -459,6 +550,7 @@ static const CGFloat kTabBarHeight = 34.0;
     if (self.restoring) return;
     std::ofstream f(statePath(), std::ios::trunc);
     f << C(self.activeId) << "\n";
+    f << self.nextUntitled << "\n";
     for (NSString* nid in self.openIds) {
         f << C(nid) << "\n";
     }
@@ -478,12 +570,10 @@ static const CGFloat kTabBarHeight = 34.0;
     [self persistState];
 }
 
-// Cmd+Shift+S — Save As… (default ~/Documents/Notes/, .txt or any extension).
-- (void)saveAs:(id)sender {
-    if (!self.activeId) return;
-    NSString* content = [self.textView string] ?: @"";
-    NSString* nid = self.activeId;
-
+// Save As… core: export content to a user-chosen file, bind the note,
+// refresh the tab title. Calls completion(YES) on success.
+- (void)saveAsContent:(NSString*)content forId:(NSString*)nid
+          completion:(void(^)(BOOL saved))completion {
     NSSavePanel* panel = [NSSavePanel savePanel];
     [panel setCanCreateDirectories:YES];
     [panel setAllowsOtherFileTypes:YES];
@@ -493,18 +583,27 @@ static const CGFloat kTabBarHeight = 34.0;
 
     Note n = [self noteForId:nid];
     NSString* defaultName = n.filepath.empty()
-        ? @"Untitled.txt"
+        ? [NSString stringWithFormat:@"%@.txt", S(n.title)]
         : S(basenameOf(n.filepath));
     [panel setNameFieldStringValue:defaultName];
 
     __weak AppDelegate* weakSelf = self;
     [panel beginSheetModalForWindow:self.window completionHandler:^(NSInteger result) {
-        if (result != NSModalResponseOK) return;
+        if (result != NSModalResponseOK) {
+            if (completion) completion(NO);
+            return;
+        }
         NSURL* url = [panel URL];
-        if (!url) return;
+        if (!url) {
+            if (completion) completion(NO);
+            return;
+        }
         std::string path = C([[url path] stringByStandardizingPath]);
         AppDelegate* strongSelf = weakSelf;
-        if (!strongSelf) return;
+        if (!strongSelf) {
+            if (completion) completion(NO);
+            return;
+        }
 
         NSError* err = nil;
         BOOL ok = [content writeToURL:url atomically:YES
@@ -514,13 +613,24 @@ static const CGFloat kTabBarHeight = 34.0;
             [alert setMessageText:@"Could not save file"];
             [alert setInformativeText:[err localizedDescription] ?: @"Unknown error"];
             [alert runModal];
+            if (completion) completion(NO);
             return;
         }
-        // Bind the note to this file and refresh the tab title.
-        saveNote(C(nid), C(content), path);
+        // Bind the note to this file; tab title becomes the filename.
+        std::string fname = basenameOf(path);
+        saveNote(C(nid), C(content), path, fname);
         [strongSelf rebuildTabBar];
         [strongSelf persistState];
+        if (completion) completion(YES);
     }];
+}
+
+// Cmd+Shift+S — Save As… for the active tab.
+- (void)saveAs:(id)sender {
+    if (!self.activeId) return;
+    [self flushActive];
+    NSString* content = [self.textView string] ?: @"";
+    [self saveAsContent:content forId:self.activeId completion:nil];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)app {

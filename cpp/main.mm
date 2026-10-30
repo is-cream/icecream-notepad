@@ -237,7 +237,8 @@ static inline std::string C(NSString* s) {
     if (self.restoring) return;
     NSTextStorage* ts = [notification object];
     for (TabInfo* info in self.tabInfos) {
-        if ([[info.textView textStorage] == ts]) {
+        NSTextStorage* tvStorage = [[info textView] textStorage];
+        if (tvStorage == ts) {
             std::string content = C([info.textView string]);
             saveNote(C(info.nid), content);
             NSString* label = S(titleFor(content));

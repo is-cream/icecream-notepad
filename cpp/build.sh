@@ -12,6 +12,18 @@ rm -rf "Icecream Notepad.app"
 mkdir -p "Icecream Notepad.app/Contents/MacOS"
 mkdir -p "Icecream Notepad.app/Contents/Resources"
 cp "Icecream Notepad" "Icecream Notepad.app/Contents/MacOS/Icecream Notepad"
+
+# App icon: build Icon.icns from Icon.png via iconutil (macOS only).
+if [ -f "Icon.png" ]; then
+  echo "Building icon…"
+  rm -rf Icon.iconset && mkdir Icon.iconset
+  for s in 16 32 128 256 512; do
+    sips -z $s $s Icon.png --out Icon.iconset/icon_${s}x${s}.png >/dev/null
+    sips -z $((s*2)) $((s*2)) Icon.png --out Icon.iconset/icon_${s}x${s}@2x.png >/dev/null
+  done
+  iconutil -c icns Icon.iconset -o "Icecream Notepad.app/Contents/Resources/Icon.icns"
+  rm -rf Icon.iconset
+fi
 cat > "Icecream Notepad.app/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -25,6 +37,8 @@ cat > "Icecream Notepad.app/Contents/Info.plist" <<'EOF'
   <string>Icecream Notepad</string>
   <key>CFBundleDisplayName</key>
   <string>Icecream Notepad</string>
+  <key>CFBundleIconFile</key>
+  <string>Icon</string>
   <key>CFBundleVersion</key>
   <string>1.0.0</string>
   <key>CFBundleShortVersionString</key>
